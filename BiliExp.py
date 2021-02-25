@@ -1,131 +1,169 @@
 # -*- coding: utf-8 -*-
-from models.Biliapi import BiliWebApi
-from models.PushMessage import PushMessage
-import json, time
-import logging
+import asyncio, time, logging, sys, io, os
+from importlib import import_module
+from collections import OrderedDict
+from getopt import getopt
+from BiliClient import asyncbili
+import tasks
+try:
+    from json5 import loads
+except:
+    from json import loads
 
-def bili_exp(cookieData, pm):
-   "B站直播签到，投币分享获取经验，模拟观看一个视频"
-   try:
-       biliapi = BiliWebApi(cookieData)
-   except Exception as e: 
-       logging.info(f'登录验证id为{cookieData["DedeUserID"]}的账户失败，原因为({str(e)})，跳过此账户后续所有操作')
-       pm.addMsg(f'id为：{cookieData["DedeUserID"]} 的账户登录失败')
-       return
+main_version = (1, 2, 0)
+main_version_str = '.'.join(map(str, main_version))
 
-   pm.addMsg(f'目前账户为：({biliapi.getUserName()})')
-   logging.info(f'登录账户 ({biliapi.getUserName()}) 成功')
+def version_compare(version: str):
+    ver = tuple(map(int, version.strip().split('.')))
+    for ii in range(len(main_version)):
+        if ver[ii] < main_version[ii]:
+            return False
+    return True
 
-   rdata = {
-       "直播签到": False,
-       "投币数量": 0,
-       "视频观看": False,
-       "视频分享": False,
-       "脚本执行前经验": 0,
-       "脚本执行前硬币": 0,
-       }
+def initlog(log_file: str, log_console: bool, msg_raw: bool = False):
+    '''初始化日志参数'''
+    logger_raw = logging.getLogger()
+    logger_raw.setLevel(logging.INFO)
+    formatter1 = logging.Formatter("[%(levelname)s]: %(message)s")
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')#输出到日志文件
+            file_handler.setFormatter(formatter1)
+            logger_raw.addHandler(file_handler)
+        except:
+            ...
+    if log_console:
+        console_handler = logging.StreamHandler(stream=sys.stdout) #输出到控制台
+        console_handler.setFormatter(formatter1)
+        logger_raw.addHandler(console_handler)
+    formatter2 = logging.Formatter("%(message)s")
+    if msg_raw:
+        log_raw = io.StringIO() #用于记录完整日志
+        strio_handler = logging.StreamHandler(stream=log_raw) #输出到log_raw用于消息推送
+        strio_handler.setFormatter(formatter2)
+        logger_raw.addHandler(strio_handler)
+        return log_raw
+    return None
 
-   try:
-       if biliapi.vipPrivilegeReceive(1)["code"] == 0:
-           rdata["领取大会员B币"] = True
-       if biliapi.vipPrivilegeReceive(2)["code"] == 0:
-           rdata["领取会员购优惠券"] = True
-   except:
-       pass
+def init_message(configData: dict):
+    '''初始化消息推送'''
+    if 'webhook' in configData and 'variable' in configData["webhook"]:
+        tasks.webhook.set(configData["webhook"])
+        if 'msg_raw' in configData["webhook"]["variable"]:
+            log_raw = initlog(configData["log_file"], configData["log_console"], True)
+            tasks.webhook.addMsgStream('msg_raw', log_raw)
+        else:
+            initlog(configData["log_file"], configData["log_console"])
+        if 'msg_simple' in configData["webhook"]["variable"]:
+            tasks.webhook.addMsgStream('msg_simple')
+    else:
+        initlog(configData["log_file"], configData["log_console"])
 
-   try:
-       xliveInfo = biliapi.xliveSign()
-       logging.info(f'bilibili直播签到信息：{str(xliveInfo)}')
-       rdata["直播签到"] = (xliveInfo["code"] == 0)
-   except Exception as e:
-       logging.warning(f'直播签到异常，原因为{str(e)}')
+def load_config(path: str) -> OrderedDict:
+    '''加载配置文件'''
+    if path:
+        with open(path,'r',encoding='utf-8') as fp:
+            return loads(fp.read(), object_pairs_hook=OrderedDict)
+    else:
+        for path in ('./config/config.json', './config.json', '/etc/BiliExp/config.json'):
+            if os.path.exists(path):
+                with open(path,'r',encoding='utf-8') as fp:
+                    return loads(fp.read(), object_pairs_hook=OrderedDict)
+        raise RuntimeError('未找到配置文件')
 
-   try:
-        room_id = biliapi.xliveGetRecommendList()["data"]["list"][6]["roomid"]
-        uid = biliapi.xliveGetRoomInfo(room_id)["data"]["room_info"]["uid"]
-        now_time = int(time.time())
-        bagList = biliapi.xliveGiftBagList()["data"]["list"]
-        for x in bagList:
-            if x["expire_at"] - now_time < 172800: #礼物到期时间小于2天
-                ret = biliapi.xliveBagSend(room_id, uid, x["bag_id"], x["gift_id"], x["gift_num"])
-                if ret["code"] == 0:
-                    logging.info(f'{ret["data"]["send_tips"]} {ret["data"]["gift_name"]} 数量{ret["data"]["gift_num"]}')
-   except Exception as e:
-       logging.warning(f'直播送出即将过期礼物异常，原因为{str(e)}')
+async def start(configData: dict):
+    '''开始任务'''
+    config_version = configData.get('version', '1.0.0')
+    if version_compare(config_version):
+        logging.info(f'当前程序版本为v{main_version_str},配置文件版本为v{config_version}')
+    else:
+        logging.warning(f'当前程序版本为v{main_version_str},配置文件版本为v{config_version},可更新配置文件')
+        tasks.webhook.addMsg('msg_simple', '有新版本配置文件可供使用\n')
+    
+    await asyncio.wait([run_user_tasks(user, configData["default"]) for user in configData["users"]]) #执行任务
+    await tasks.webhook.send() #推送消息
 
-   try:
-       reward = biliapi.getReward()
-       logging.info(f'经验脚本开始前经验信息 ：{str(reward)}')
-   except Exception as e: 
-       logging.warning(f'获取账户经验信息异常，原因为{str(e)}，跳过此账户后续所有操作')
-       pm.addMsg(str(rdata))
-       return
+async def run_user_tasks(user: dict,           #用户配置
+                         default: dict          #默认配置
+                         ) -> None:
+    async with asyncbili() as biliapi:
+        try:
+            if not await biliapi.login_by_cookie(user["cookieDatas"]):
+                logging.warning(f'id为{user["cookieDatas"]["DedeUserID"]}的账户cookie失效，跳过此账户后续操作')
+                tasks.webhook.addMsg('msg_simple', f'id为{user["cookieDatas"]["DedeUserID"]}的账户cookie失效\n')
+                return
+        except Exception as e: 
+            logging.warning(f'登录验证id为{user["cookieDatas"]["DedeUserID"]}的账户失败，原因为{str(e)}，跳过此账户后续操作')
+            return
 
-   rdata["脚本执行前经验"] = reward["level_info"]["current_exp"]
+        show_name = user.get("show_name", "")
+        if show_name:
+            biliapi.name = show_name
 
-   try:
-       coin_num = biliapi.getCoin()
-   except Exception as e: 
-       logging.warning(f'获取账户剩余硬币数异常，原因为{str(e)}')
-       coin_num = 0
+        logging.info(f'{biliapi.name}: 等级{biliapi.level},经验{biliapi.myexp},剩余硬币{biliapi.mycoin}')
+        tasks.webhook.addMsg('msg_simple', f'{biliapi.name}: 等级{biliapi.level},经验{biliapi.myexp},剩余硬币{biliapi.mycoin}\n')
 
-   rdata["脚本执行前硬币"] = coin_num
+        task_array = [] #存放本账户所有任务
 
-   coin_exp_num = (50 - reward["coins_av"]) // 10
-   toubi_num = coin_exp_num if coin_num > coin_exp_num else coin_num
+        for task in default: #遍历任务列表，把需要运行的任务添加到task_array
 
-   try:
-       datas = biliapi.getRegions()
-   except Exception as e: 
-       logging.warning(f'获取B站分区视频信息异常，原因为{str(e)}，跳过此账户后续所有操作')
-       pm.addMsg(str(rdata))
-       return
+            try:
+                task_module = import_module(f'tasks.{task}') #加载任务模块
+            except ModuleNotFoundError:
+                logging.error(f'{biliapi.name}: 未找到任务模块{task}')
+                continue
 
-   if(toubi_num > 0):
-       for i in range(toubi_num):
-           try:
-               info = biliapi.coin(datas[i]["aid"], 1, 1)
-               logging.info(f'投币信息 ：{str(info)}')
-               if(info["code"] == 0):
-                   rdata["投币数量"] += 1
-           except Exception as e: 
-               logging.warning(f'投币异常，原因为{str(e)}')
+            task_function = getattr(task_module, task, None)
+            if not task_function:
+                logging.error(f'{biliapi.name}: 未找到任务{task}的入口函数')
+                continue
 
-   try:
-       info = biliapi.report(datas[5]["aid"], datas[5]["cid"], 300)
-       logging.info(f'模拟视频观看进度上报：{str(info)}')
-       rdata["视频观看"] = (info["code"] == 0)
-   except Exception as e: 
-       logging.warning(f'模拟视频观看异常，原因为{str(e)}')
+            if task in user["tasks"]:
+                if isinstance(user["tasks"][task], bool):
+                    if user["tasks"][task]:
+                        task_array.append(task_function(biliapi))
+                elif isinstance(user["tasks"][task], dict):
+                    if 'enable' in user["tasks"][task] and user["tasks"][task]["enable"]:
+                        task_array.append(task_function(biliapi, user["tasks"][task]))
+            else:
+                if isinstance(default[task], bool):
+                    if default[task]:
+                        task_array.append(task_function(biliapi))
+                elif isinstance(default[task], dict):
+                    if 'enable' in default[task] and default[task]["enable"]:
+                        task_array.append(task_function(biliapi, default[task]))
 
-   try:
-       info = biliapi.share(datas[5]["aid"])
-       logging.info(f'分享视频结果：{str(info)}')
-       rdata["视频分享"] = (info["code"] == 0)
-   except Exception as e: 
-       logging.warning(f'分享视频异常，原因为{str(e)}')
+        if task_array:
+            await asyncio.wait(task_array)        #异步等待所有任务完成
 
-   pm.addMsg(str(rdata))
-   logging.info('本账户操作全部完成')
-
-def main(*args):
+def main(*args, **kwargs):
     try:
-        logging.basicConfig(filename="exp.log", filemode='a', level=logging.INFO, format="%(asctime)s: %(levelname)s, %(message)s", datefmt="%Y/%d/%m %H:%M:%S")
-    except:
-        pass
-
-    with open('config/config.json','r',encoding='utf-8') as fp:
-        configData = json.load(fp)
-
-    pm = PushMessage(title="B站经验脚本消息推送", email=configData["email"])
-
-    for x in configData["cookieDatas"]:
-        bili_exp(x, pm)
-
-    try:
-        pm.pushMessage()
+        configData = load_config(kwargs.get("config", None))
     except Exception as e: 
-        logging.warning(f'消息推送异常，原因为{str(e)}')
+        print(f'配置加载异常，原因为{str(e)}，退出程序')
+        sys.exit(6)
+
+    if 'log' in kwargs:
+        configData["log_file"] = kwargs["log"]
+
+    init_message(configData) #初始化消息推送
+
+    #启动任务
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(start(configData))
 
 if __name__=="__main__":
-    main()
+    kwargs = {}
+    opts, args = getopt(sys.argv[1:], "hvc:l:",["configfile=","logfile="])
+    for opt, arg in opts:
+        if opt in ('-c','--configfile'):
+            kwargs["config"] = arg
+        elif opt in ('-l','--logfile'):
+            kwargs["log"] = arg
+        elif opt == '-h':
+            print('BliExp -c <configfile> -l <logfile>')
+            sys.exit()
+        elif opt == '-v':
+            print(f'BiliExp v{main_version_str}')
+            sys.exit()
+    main(**kwargs)
